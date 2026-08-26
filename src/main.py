@@ -35,32 +35,33 @@ ANTISPOOF_CONFIDENCE_THRESHOLD = 0.70  # DeepFace's own score; frames below this
 
 def get_student_id() -> str:
     """
-    Prompt for a Student ID and sanitize it into something safe to use
-    as a folder name. Also warns (rather than silently overwrites) if
-    that student already has a dataset folder.
+    Prompt for a Student ID, validated to be filesystem-safe.
+    If invalid characters entered, we reject and re-prompt so the
+    person knows what happened.
     """
+    valid_pattern = re.compile(r"^[A-Za-z0-9_-]+$")
+
     while True:
-        raw_id = input("Enter Student ID: ").strip()
+        raw_id = input("Enter Student ID (letters, numbers, _ and - only): ").strip()
 
-        # Only allow letters, numbers, underscores, hyphens - keeps the
-        # folder name filesystem-safe regardless of what the user types.
-        student_id = re.sub(r"[^A-Za-z0-9_-]", "", raw_id)
-
-        if not student_id:
-            print("Student ID can't be empty (or contained only invalid characters). Try again.")
+        if not raw_id:
+            print("Student ID can't be empty. Try again.")
             continue
 
-        target_folder = os.path.join(DATASET_DIR, f"Student_{student_id}")
+        if not valid_pattern.match(raw_id):
+            print(f"'{raw_id}' contains characters that aren't allowed (only letters, numbers, _, - are permitted). Try again.")
+            continue
+
+        target_folder = os.path.join(DATASET_DIR, f"Student_{raw_id}")
         if os.path.exists(target_folder) and os.listdir(target_folder):
             choice = input(
                 f"'{target_folder}' already has images. Overwrite? (y/n): "
             ).strip().lower()
             if choice != "y":
-                continue  # ask for a fresh ID instead
+                continue
 
-        return student_id
-
-
+        return raw_id
+    
 def box_iou(box_a, box_b):
     """
     Intersection-over-Union between two (x, y, w, h) boxes: 0 means no
