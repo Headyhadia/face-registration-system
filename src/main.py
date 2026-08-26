@@ -33,8 +33,7 @@ LIVENESS_CHECK_EVERY_N_FRAMES = 5      # run the model every Nth frame, not ever
 CAPTURE_EVERY_N_FRAMES = 8             # spacing between saved images, for slight pose variety
 ANTISPOOF_CONFIDENCE_THRESHOLD = 0.70  # DeepFace's own score; frames below this count as "spoof"
 MAX_REGISTRATION_SECONDS = 25          # overall time limit per registration attempt
-MAX_CONSECUTIVE_IDENTITY_MISSES = 3    # liveness-check misses in a row before we consider the tracked face "gone"
-
+IDENTITY_LOST_GRACE_SECONDS = 2.5      # how long we wait after losing the tracked face before cancelling
 def get_student_id() -> str:
     """
     Prompt for a Student ID, validated to be filesystem-safe.
@@ -252,7 +251,7 @@ def run_registration(student_id: str) -> bool:
     ever_saw_spoof = False
     locked_box = None
     had_lock = False           # have we ever established a tracked identity this session
-    identity_miss_streak = 0
+    lost_since = None          # timestamp when tracking was first lost, or None if currently tracked
     captured_crops = []        # buffered in memory - nothing written to disk until success
     start_time = time.time()
     outcome = None              # 'success' | 'user_quit' | 'timeout_spoof' | 'timeout_generic' | 'identity_lost'
@@ -283,10 +282,11 @@ def run_registration(student_id: str) -> bool:
                 )
 
                 if lost_this_check:
-                    identity_miss_streak += 1
                     consecutive_live = 0
+                    if lost_since is None:
+                        lost_since = time.time()
                 else:
-                    identity_miss_streak = 0
+                    lost_since = None  # tracking recovered - grace period cancelled
                     locked_box = last_result["box"]
                     had_lock = True
                     if last_result["is_real"]:
@@ -295,15 +295,21 @@ def run_registration(student_id: str) -> bool:
                         consecutive_live = 0
                         ever_saw_spoof = True
 
-                if had_lock and identity_miss_streak >= MAX_CONSECUTIVE_IDENTITY_MISSES:
-                    # The face we were tracking is gone (stepped away, or
-                    # replaced by someone else) - cancel rather than quietly
-                    # continuing to fill the buffer with a different person.
+                if had_lock and lost_since is not None and (time.time() - lost_since) > IDENTITY_LOST_GRACE_SECONDS:
+                    # Gave the person a real window to step back into frame
+                    # after a momentary loss - if they haven't stepped by now,
+                    # treat it as genuinely gone rather than a brief glitch.
                     outcome = "identity_lost"
                     break
 
             display_frame = frame.copy()
             draw_overlay(display_frame, last_result, consecutive_live, len(captured_crops))
+            if lost_since is not None:
+                remaining = max(0, IDENTITY_LOST_GRACE_SECONDS - (time.time() - lost_since))
+                cv2.putText(
+                    display_frame, f"Face lost - return within {remaining:.1f}s",
+                    (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2,
+                )
             cv2.imshow(window_name, display_frame)
 
             if (
@@ -335,7 +341,6 @@ def run_registration(student_id: str) -> bool:
         for i, crop in enumerate(captured_crops, start=1):
             cv2.imwrite(os.path.join(output_folder, f"image_{i}.jpg"), crop)
         print("\nFace registration successful.")
-        print(f"{len(captured_crops)} images saved to '{output_folder}'.")
         return True
 
     messages = {
