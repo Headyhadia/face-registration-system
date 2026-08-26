@@ -166,9 +166,8 @@ def analyze_frame(frame, locked_box):
 def draw_overlay(frame, result, consecutive_live, saved_count):
     """
     Draws the bounding box + status text on the frame so the person doing
-    the registration gets live feedback: are they detected, are they being
-    read as real or spoof, and how many images have been captured so far.
-    Pure UI - no effect on the actual pipeline logic.
+    the registration gets live feedback. Pure UI - never touches the saved
+    image data (that's handled separately with a clean copy of the frame).
     """
     if result is None:
         cv2.putText(
@@ -179,7 +178,13 @@ def draw_overlay(frame, result, consecutive_live, saved_count):
         x, y, w, h = result["box"]
         if result["is_real"]:
             color = (0, 200, 0)
-            label = f"REAL ({result['score']:.2f}) - {consecutive_live}/{REQUIRED_CONSECUTIVE_LIVE}"
+            if consecutive_live >= REQUIRED_CONSECUTIVE_LIVE:
+                # Once the streak requirement is already met, showing the
+                # raw (still-climbing) count looks like a bug - switch to a
+                # clear "capturing" status instead.
+                label = f"LIVE - capturing ({saved_count}/{IMAGES_TO_CAPTURE})"
+            else:
+                label = f"REAL ({result['score']:.2f}) - {consecutive_live}/{REQUIRED_CONSECUTIVE_LIVE}"
         else:
             color = (0, 0, 255)
             label = f"SPOOF SUSPECTED ({result['score']:.2f})"
@@ -198,7 +203,6 @@ def draw_overlay(frame, result, consecutive_live, saved_count):
         frame, "Press 'q' to cancel", (20, frame.shape[0] - 50),
         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1,
     )
-
 
 def run_registration(student_id: str) -> bool:
     """
