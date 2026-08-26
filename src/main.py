@@ -9,6 +9,7 @@ dataset/Student_<ID>/ for later use in a recognition system.
 
 import os
 import re
+import time
 import threading
 import numpy as np
 
@@ -31,7 +32,8 @@ REQUIRED_CONSECUTIVE_LIVE = 6          # liveness checks in a row before we star
 LIVENESS_CHECK_EVERY_N_FRAMES = 5      # run the model every Nth frame, not every frame
 CAPTURE_EVERY_N_FRAMES = 8             # spacing between saved images, for slight pose variety
 ANTISPOOF_CONFIDENCE_THRESHOLD = 0.70  # DeepFace's own score; frames below this count as "spoof"
-
+MAX_REGISTRATION_SECONDS = 25          # overall time limit per registration attempt
+MAX_CONSECUTIVE_IDENTITY_MISSES = 3    # liveness-check misses in a row before we consider the tracked face "gone"
 
 def get_student_id() -> str:
     """
@@ -206,12 +208,15 @@ def draw_overlay(frame, result, consecutive_live, saved_count):
 
 def run_registration(student_id: str) -> bool:
     """
-    Runs the live capture loop for one student. Returns True on a
-    successful registration (enough live images saved), False if the
-    user quit early or liveness was never established.
+    Runs the live capture loop for one student.
+
+    Captured face crops are held in memory and only written to disk once
+    the entire registration succeeds - a cancelled, timed-out, or
+    identity-interrupted attempt leaves no folder and no partial images
+    behind, and never mixes two different people's faces into one
+    student's dataset.
     """
     output_folder = os.path.join(DATASET_DIR, f"Student_{student_id}")
-    os.makedirs(output_folder, exist_ok=True)
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -219,14 +224,7 @@ def run_registration(student_id: str) -> bool:
         return False
 
     window_name = "Face Registration - press q to cancel"
-    # WINDOW_GUI_NORMAL (rather than the default) strips out OpenCV's extra
-    # Qt/GTK toolbar (the zoom/save/properties row with the dropdown arrow)
-    # that was causing the window to render blank until interacted with.
-    # This also naturally sizes to the actual webcam resolution, restoring
-    # the original correct size instead of the fixed 960x720.
     cv2.namedWindow(window_name, cv2.WINDOW_GUI_NORMAL)
-
-
 
     loading_screen = np.zeros((480, 640, 3), dtype="uint8")
     cv2.putText(
@@ -245,121 +243,111 @@ def run_registration(student_id: str) -> bool:
         model_ready.set()
 
     threading.Thread(target=warm_up, daemon=True).start()
-
-    # Pump the GUI event loop every ~50ms so the OS doesn't consider the
-    # window unresponsive while we wait, without trying to render live
-    # video during this phase.
     while not model_ready.is_set():
         cv2.waitKey(50)
 
     frame_count = 0
     consecutive_live = 0
-    saved_count = 0
-    last_result = None  # reused between the (less frequent) liveness checks so the overlay doesn't flicker
+    last_result = None
     ever_saw_spoof = False
-    locked_box = None  # the position of the face we've committed to tracking, once liveness starts building
+    locked_box = None
+    had_lock = False           # have we ever established a tracked identity this session
+    identity_miss_streak = 0
+    captured_crops = []        # buffered in memory - nothing written to disk until success
+    start_time = time.time()
+    outcome = None              # 'success' | 'user_quit' | 'timeout_spoof' | 'timeout_generic' | 'identity_lost'
 
-    print("\nLoading models in the background - camera preview is already live.")
-    print("Look at the camera. Hold still and well-lit for best results.")
+    print("\nLook at the camera. Hold still and well-lit for best results.")
     print("Registration begins automatically once liveness is confirmed.\n")
 
     try:
-        while saved_count < IMAGES_TO_CAPTURE:
+        while len(captured_crops) < IMAGES_TO_CAPTURE:
             ok, frame = cap.read()
             if not ok:
                 print("ERROR: Lost connection to the webcam.")
+                outcome = "user_quit"
                 break
 
             frame_count += 1
 
-            if not model_ready.is_set():
-                # Model's still loading in the background - show live video
-                # with a status overlay, but skip detection entirely so we
-                # don't touch DeepFace until the background thread is done
-                # warming it up (avoids loading it twice/racing on it).
-                cv2.putText(
-                    frame, "Loading models, please wait...", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2,
-                )
-                cv2.imshow(window_name, frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    print("\nCancelled by user.")
-                    break
-                continue
+            if time.time() - start_time > MAX_REGISTRATION_SECONDS:
+                outcome = "timeout_spoof" if ever_saw_spoof else "timeout_generic"
+                break
 
-            # Anti-spoofing inference is the expensive step, so we don't run it
-            # on every single frame - just often enough to react quickly while
-            # keeping the preview smooth.
             if frame_count % LIVENESS_CHECK_EVERY_N_FRAMES == 0:
                 last_result = analyze_frame(frame, locked_box)
 
-                if last_result is None or not last_result["same_identity"] and locked_box is not None:
-                    # Either nobody's there, or the tracked person appears to
-                    # have been replaced by someone else in frame - don't let
-                    # a bystander's face silently continue the count.
+                lost_this_check = (
+                    last_result is None
+                    or (locked_box is not None and not last_result["same_identity"])
+                )
+
+                if lost_this_check:
+                    identity_miss_streak += 1
                     consecutive_live = 0
-                    locked_box = None
-                elif last_result["is_real"]:
-                    consecutive_live += 1
-                    locked_box = last_result["box"]  # keep tracking this exact face going forward
                 else:
-                    consecutive_live = 0
-                    locked_box = last_result["box"]  # still lock on - person is there, just not confirmed live yet
-                    ever_saw_spoof = True
+                    identity_miss_streak = 0
+                    locked_box = last_result["box"]
+                    had_lock = True
+                    if last_result["is_real"]:
+                        consecutive_live += 1
+                    else:
+                        consecutive_live = 0
+                        ever_saw_spoof = True
+
+                if had_lock and identity_miss_streak >= MAX_CONSECUTIVE_IDENTITY_MISSES:
+                    # The face we were tracking is gone (stepped away, or
+                    # replaced by someone else) - cancel rather than quietly
+                    # continuing to fill the buffer with a different person.
+                    outcome = "identity_lost"
+                    break
 
             display_frame = frame.copy()
-            draw_overlay(display_frame, last_result, consecutive_live, saved_count)
+            draw_overlay(display_frame, last_result, consecutive_live, len(captured_crops))
             cv2.imshow(window_name, display_frame)
 
-            # Only start saving once seen enough consecutive live reads -
-            # this is what will makes a single lucky misclassification insufficient
-            # to fool the system, and what makes a held-up photo/screen (which
-            # reads consistently as spoof, not randomly) get reliably rejected.
             if (
                 consecutive_live >= REQUIRED_CONSECUTIVE_LIVE
                 and frame_count % CAPTURE_EVERY_N_FRAMES == 0
             ):
                 x, y, w, h = last_result["box"]
-                # Small margin around the tight detection box - standard
-                # practice for face datasets, since a bit of context around
-                # the face (not just eyes-nose-mouth) tends to help whatever
-                # recognition model consumes this dataset later. Clamped to
-                # the frame edges so it never reads outside the image bounds.
                 margin = int(0.2 * max(w, h))
                 x1 = max(0, x - margin)
                 y1 = max(0, y - margin)
                 x2 = min(frame.shape[1], x + w + margin)
                 y2 = min(frame.shape[0], y + h + margin)
-                face_crop = frame[y1:y2, x1:x2]
-
-                image_path = os.path.join(output_folder, f"image_{saved_count + 1}.jpg")
-                cv2.imwrite(image_path, face_crop)
-                saved_count += 1
-                print(f"Captured image {saved_count}/{IMAGES_TO_CAPTURE}")
+                captured_crops.append(frame[y1:y2, x1:x2].copy())
+                print(f"Captured image {len(captured_crops)}/{IMAGES_TO_CAPTURE}")
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
-                print("\nCancelled by user.")
+                outcome = "user_quit"
                 break
 
     finally:
         cap.release()
         cv2.destroyAllWindows()
 
-    if saved_count >= IMAGES_TO_CAPTURE:
-        print("Face registration successful.")
-        print(f"{saved_count} images saved to '{output_folder}'.")
+    if outcome is None and len(captured_crops) >= IMAGES_TO_CAPTURE:
+        outcome = "success"
+
+    if outcome == "success":
+        os.makedirs(output_folder, exist_ok=True)
+        for i, crop in enumerate(captured_crops, start=1):
+            cv2.imwrite(os.path.join(output_folder, f"image_{i}.jpg"), crop)
+        print("\nFace registration successful.")
+        print(f"{len(captured_crops)} images saved to '{output_folder}'.")
         return True
 
-    # Distinguish *why* it failed - a spoof attempt vs. a plain early quit -
-    if ever_saw_spoof and consecutive_live == 0:
-        print("\nWARNING: Live person not detected (possible spoof attempt). Registration cancelled.")
-    else:
-        print("\nRegistration cancelled before enough images were captured.")
+    messages = {
+        "user_quit": "\nRegistration cancelled by user.",
+        "timeout_spoof": "\nWARNING: Live person not detected. Face registration cancelled.",
+        "timeout_generic": "\nNo live face confirmed within the time limit. Registration cancelled.",
+        "identity_lost": "\nThe tracked face changed or left the frame. Registration cancelled for safety - please try again.",
+    }
+    print(messages.get(outcome, "\nRegistration cancelled before enough images were captured."))
     return False
 
-
 def main():
-    os.makedirs(DATASET_DIR, exist_ok=True)
     student_id = get_student_id()
     run_registration(student_id)
 
